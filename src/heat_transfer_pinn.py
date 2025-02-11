@@ -125,10 +125,10 @@ def top_boundary_loss(model, t_bc, T_bc, theta_bc):
     """
     model: PINN
     t_bc: times at top boundary
-    T_bc: known boundary temperature at z=0
+    T_bc: known boundary temperature at z=0.40
     theta_bc: known theta at top boundary
     """
-    z0 = torch.zeros_like(t_bc)
+    z0 = 0.04 * torch.ones_like(t_bc)
     T_pred = model(t_bc, z0, theta_bc)
     return (T_pred.squeeze() - T_bc.squeeze())**2
 
@@ -177,109 +177,113 @@ def data_loss(model, t, z, theta, T_meas):
     T_pred = model(t, z, theta)
     return torch.mean((T_pred - T_meas)**2)
 
-#---------------------------------------------------
-#         Prepare Collocation Points & Data
-#---------------------------------------------------
-# Load your measured data:
-df = pd.read_csv("data/processed/merged_data_filtered.csv", parse_dates=["Time"])
-df["time_s"] = (df["Time"] - df["Time"].min()).dt.total_seconds()
-df["z_m"] = df["Height"] / 1000.0
-df = df.dropna(subset=["VWC"])
+if __name__ == "__main__":
+    #---------------------------------------------------
+    #         Prepare Collocation Points & Data
+    #---------------------------------------------------
+    # Load your measured data:
+    df = pd.read_csv("data/processed/merged_data_filtered.csv", parse_dates=["Time"])
+    df["time_s"] = (df["Time"] - df["Time"].min()).dt.total_seconds()
+    df["z_m"] = df["Height"] / 1000.0
+    df = df.dropna(subset=["VWC"])
 
-# Create tensors for the data (for data loss):
-t_data = torch.tensor(df["time_s"].values, dtype=torch.float32).reshape(-1,1)
-z_data = torch.tensor(df["z_m"].values, dtype=torch.float32).reshape(-1,1)
-theta_data = torch.tensor(df["VWC"].values, dtype=torch.float32).reshape(-1,1)
-T_measured_data = torch.tensor(df["SoilTemp"].values, dtype=torch.float32).reshape(-1,1)
+    # Create tensors for the data (for data loss):
+    t_data = torch.tensor(df["time_s"].values, dtype=torch.float32).reshape(-1,1)
+    z_data = torch.tensor(df["z_m"].values, dtype=torch.float32).reshape(-1,1)
+    theta_data = torch.tensor(df["VWC"].values, dtype=torch.float32).reshape(-1,1)
+    T_measured_data = torch.tensor(df["SoilTemp"].values, dtype=torch.float32).reshape(-1,1)
 
-# For PDE collocation, you may still use a mesh covering the domain.
-t_min = df["time_s"].min()
-t_max = df["time_s"].max()
-z_min = df["z_m"].min()
-z_max = df["z_m"].max()
+    # For PDE collocation, you may still use a mesh covering the domain.
+    t_min = df["time_s"].min()
+    t_max = df["time_s"].max()
+    z_min = df["z_m"].min()
+    z_max = df["z_m"].max()
 
-N_t = 100
-N_z = 100
-t_lin = np.linspace(t_min, t_max, N_t)
-z_lin = np.linspace(z_min, z_max, N_z)
-T_mesh, Z_mesh = np.meshgrid(t_lin, z_lin, indexing='xy')
+    N_t = 100
+    N_z = 100
+    t_lin = np.linspace(t_min, t_max, N_t)
+    z_lin = np.linspace(z_min, z_max, N_z)
+    T_mesh, Z_mesh = np.meshgrid(t_lin, z_lin, indexing='xy')
 
-# Each measured point is (time, depth)
-measured_points = np.column_stack((df["time_s"].values, df["z_m"].values))
-theta_measured = df["VWC"].values  # measured θ values
+    # Each measured point is (time, depth)
+    measured_points = np.column_stack((df["time_s"].values, df["z_m"].values))
+    theta_measured = df["VWC"].values  # measured θ values
 
-# Interpolate θ on the collocation grid (linear interpolation)
-Theta_mesh = griddata(measured_points, theta_measured, (T_mesh, Z_mesh), method='linear')
+    # Interpolate θ on the collocation grid (linear interpolation)
+    Theta_mesh = griddata(measured_points, theta_measured, (T_mesh, Z_mesh), method='linear')
 
-# For points outside the convex hull, fill missing values with nearest-neighbor interpolation:
-nan_idx = np.isnan(Theta_mesh)
-if np.any(nan_idx):
-    Theta_mesh[nan_idx] = griddata(measured_points, theta_measured, (T_mesh, Z_mesh), method='nearest')[nan_idx]
+    # For points outside the convex hull, fill missing values with nearest-neighbor interpolation:
+    nan_idx = np.isnan(Theta_mesh)
+    if np.any(nan_idx):
+        Theta_mesh[nan_idx] = griddata(measured_points, theta_measured, (T_mesh, Z_mesh), method='nearest')[nan_idx]
 
-t_col = torch.tensor(T_mesh.flatten(), dtype=torch.float32).reshape(-1,1)
-z_col = torch.tensor(Z_mesh.flatten(), dtype=torch.float32).reshape(-1,1)
-theta_col = torch.tensor(Theta_mesh.flatten(), dtype=torch.float32).reshape(-1,1)
+    t_col = torch.tensor(T_mesh.flatten(), dtype=torch.float32).reshape(-1,1)
+    z_col = torch.tensor(Z_mesh.flatten(), dtype=torch.float32).reshape(-1,1)
+    theta_col = torch.tensor(Theta_mesh.flatten(), dtype=torch.float32).reshape(-1,1)
 
-#---------------------------------------------------
-#       Extract Boundary & Initial Conditions from Data
-#---------------------------------------------------
-# Top boundary: use the shallowest sensor data.
-df_top = df[df["z_m"] == df["z_m"].min()].sort_values(by="time_s")
-t_bc_top = torch.tensor(df_top["time_s"].values, dtype=torch.float32).reshape(-1,1)
-T_bc_top_val = torch.tensor(df_top["SoilTemp"].values, dtype=torch.float32).reshape(-1,1)
-theta_bc_top = torch.tensor(df_top["VWC"].values, dtype=torch.float32).reshape(-1,1)
+    #---------------------------------------------------
+    #       Extract Boundary & Initial Conditions from Data
+    #---------------------------------------------------
+    # Top boundary: use the shallowest sensor data.
+    df_top = df[df["z_m"] == df["z_m"].min()].sort_values(by="time_s")
+    t_bc_top = torch.tensor(df_top["time_s"].values, dtype=torch.float32).reshape(-1,1)
+    T_bc_top_val = torch.tensor(df_top["SoilTemp"].values, dtype=torch.float32).reshape(-1,1)
+    theta_bc_top = torch.tensor(df_top["VWC"].values, dtype=torch.float32).reshape(-1,1)
 
-# Bottom boundary: use the deepest sensor data.
-df_hf = pd.read_csv("data/raw/PLEXUS@NGIF_HeatFlux_20190718_20190912.csv", parse_dates=["Time"])
-df_hf["time_s"] = (df_hf["Time"] - df_hf["Time"].min()).dt.total_seconds()
-df_hf = df_hf.sort_values(by="time_s")
-df_bot = df[df["z_m"] == df["z_m"].max()].sort_values(by="time_s")
-t_bc_bot = torch.tensor(df_bot["time_s"].values, dtype=torch.float32).reshape(-1,1)
-q_bc_bot_val = torch.tensor(df_hf["HF.Bottom"].values, dtype=torch.float32).reshape(-1, 1)
-theta_bc_bot = torch.tensor(df_bot["VWC"].values, dtype=torch.float32).reshape(-1,1)
+    # Bottom boundary: use the deepest sensor data.
+    df_hf = pd.read_csv("data/raw/PLEXUS@NGIF_HeatFlux_20190718_20190912.csv", parse_dates=["Time"])
+    df_hf["time_s"] = (df_hf["Time"] - df_hf["Time"].min()).dt.total_seconds()
+    df_hf = df_hf.sort_values(by="time_s")
+    df_bot = df[df["z_m"] == df["z_m"].max()].sort_values(by="time_s")
+    t_bc_bot = torch.tensor(df_bot["time_s"].values, dtype=torch.float32).reshape(-1,1)
+    q_bc_bot_val = torch.tensor(df_hf["HF.Bottom"].values, dtype=torch.float32).reshape(-1, 1)
+    theta_bc_bot = torch.tensor(df_bot["VWC"].values, dtype=torch.float32).reshape(-1,1)
 
-# Initial condition: use data from the earliest time.
-t0_val = df["time_s"].min()
-df_ic = df[df["time_s"] == t0_val].sort_values(by="z_m")
-z_ic_vals = torch.tensor(df_ic["z_m"].values, dtype=torch.float32).reshape(-1,1)
-T_ic_vals = torch.tensor(df_ic["SoilTemp"].values, dtype=torch.float32).reshape(-1,1)
-theta_ic_vals = torch.tensor(df_ic["VWC"].values, dtype=torch.float32).reshape(-1,1)
+    # Initial condition: use data from the earliest time.
+    t0_val = df["time_s"].min()
+    df_ic = df[df["time_s"] == t0_val].sort_values(by="z_m")
+    z_ic_vals = torch.tensor(df_ic["z_m"].values, dtype=torch.float32).reshape(-1,1)
+    T_ic_vals = torch.tensor(df_ic["SoilTemp"].values, dtype=torch.float32).reshape(-1,1)
+    theta_ic_vals = torch.tensor(df_ic["VWC"].values, dtype=torch.float32).reshape(-1,1)
 
 
-#---------------------------------------------------
-#                Training Loop
-#---------------------------------------------------
-pinn_model = PINN(num_hidden_layers=4, num_neurons=64)
-optimizer = optim.Adam(pinn_model.parameters(), lr=1e-3)
+    #---------------------------------------------------
+    #                Training Loop
+    #---------------------------------------------------
+    pinn_model = PINN(num_hidden_layers=4, num_neurons=64)
+    optimizer = optim.Adam(pinn_model.parameters(), lr=1e-3)
 
-num_epochs = 5000
+    num_epochs = 1000
 
-for epoch in range(num_epochs):
-    optimizer.zero_grad()
-    
-    # 1) PDE residual loss (from collocation points)
-    res_pde = pde_residual(pinn_model, t_col, z_col, theta_col)
-    loss_pde = torch.mean(res_pde**2)
-    
-    # 2) Top boundary loss (using measured top-boundary theta)
-    loss_bc_top = torch.mean(top_boundary_loss(pinn_model, t_bc_top, T_bc_top_val, theta_bc_top))
-    
-    # 3) Bottom boundary loss (using measured bottom-boundary theta)
-    z_bot = torch.full_like(t_bc_bot, z_max)  # set bottom depth to max z in domain
-    loss_bc_bot = torch.mean(bottom_flux_loss(pinn_model, t_bc_bot, z_bot, q_bc_bot_val, theta_bc_bot))
-    
-    # 4) Initial condition loss (using measured theta at t=0)
-    loss_ic = torch.mean(initial_condition_loss(pinn_model, z_ic_vals, T_ic_vals, theta_ic_vals))
-    
-    # 5) Data mismatch loss (comparing model predictions to all measured data)
-    loss_data = data_loss(pinn_model, t_data, z_data, theta_data, T_measured_data)
-    
-    # Combine losses (you may want to weight these differently)
-    loss = loss_pde + loss_bc_top + loss_bc_bot + loss_ic + loss_data
-    loss.backward()
-    optimizer.step()
-    
-    if epoch % 500 == 0:
-        print(f"Epoch {epoch} - Total Loss: {loss.item():.6f} "
-              f"(PDE: {loss_pde.item():.6f}, BC_top: {loss_bc_top.item():.6f}, "
-              f"BC_bot: {loss_bc_bot.item():.6f}, IC: {loss_ic.item():.6f}, Data: {loss_data.item():.6f})")
+    for epoch in range(num_epochs):
+        optimizer.zero_grad()
+        
+        # 1) PDE residual loss (from collocation points)
+        res_pde = pde_residual(pinn_model, t_col, z_col, theta_col)
+        loss_pde = torch.mean(res_pde**2)
+        
+        # 2) Top boundary loss (using measured top-boundary theta)
+        loss_bc_top = torch.mean(top_boundary_loss(pinn_model, t_bc_top, T_bc_top_val, theta_bc_top))
+        
+        # 3) Bottom boundary loss (using measured bottom-boundary theta)
+        z_bot = torch.full_like(t_bc_bot, z_max)  # set bottom depth to max z in domain
+        loss_bc_bot = torch.mean(bottom_flux_loss(pinn_model, t_bc_bot, z_bot, q_bc_bot_val, theta_bc_bot))
+        
+        # 4) Initial condition loss (using measured theta at t=0)
+        loss_ic = torch.mean(initial_condition_loss(pinn_model, z_ic_vals, T_ic_vals, theta_ic_vals))
+        
+        # 5) Data mismatch loss (comparing model predictions to all measured data)
+        loss_data = data_loss(pinn_model, t_data, z_data, theta_data, T_measured_data)
+        
+        # Combine losses (you may want to weight these differently)
+        loss = loss_pde + loss_bc_top + 0.1*loss_bc_bot + loss_ic + loss_data
+        loss.backward()
+        optimizer.step()
+        
+        if epoch % 500 == 0:
+            print(f"Epoch {epoch} - Total Loss: {loss.item():.6f} "
+                f"(PDE: {loss_pde.item():.6f}, BC_top: {loss_bc_top.item():.6f}, "
+                f"BC_bot: {loss_bc_bot.item():.6f}, IC: {loss_ic.item():.6f}, Data: {loss_data.item():.6f})")
+
+    torch.save(pinn_model.state_dict(), "pinn_model.pth")
+    print("Model saved as 'pinn_model.pth'.")
