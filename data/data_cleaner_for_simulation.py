@@ -1,6 +1,7 @@
 import pandas as pd
 import os
 import glob
+from functools import reduce
 
 raw_data_path = "data/raw"
 output_path = "data/processed"
@@ -18,6 +19,12 @@ def clean_data(raw_data_path="data/raw", output_path="data/processed"):
         else:
             continue
         df.to_csv(os.path.join(output_path, measurement.lower() + ".csv"), index=False)
+        df.set_index("Time", inplace=True)
+        df_list.append(df)
+    
+    merged = reduce(lambda left, right: pd.merge(left, right, on=['Time', 'Height'], how='outer'), df_list)
+    merged.sort_values(['Time','Height'], inplace=True)
+    merged.to_csv(os.path.join(output_path, "merged_data_filtered.csv"))
 
 def process_data(filename, measurement, replace_char="Z"):
     df = pd.read_csv(filename, parse_dates=["Time"])
@@ -33,8 +40,6 @@ def process_data(filename, measurement, replace_char="Z"):
                   var_name='Height', value_name=measurement)
     
     df_long['Height'] = df_long['Height'].str.replace(replace_char, '').astype(float)
-    # df_long['Time'] = pd.to_datetime(df_long['Time'])
-    # df_long.set_index("Time", inplace=True)
     return df_long
 
 if __name__ == "__main__":
