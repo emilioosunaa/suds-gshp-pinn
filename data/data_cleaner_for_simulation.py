@@ -26,6 +26,11 @@ def clean_data(raw_data_path="data/raw", output_path="data/processed"):
     merged.sort_values(['Time','Height'], inplace=True)
     merged.to_csv(os.path.join(output_path, "merged_data_filtered.csv"))
 
+    merged["VWC"] = merged.groupby("Time")["VWC"].transform(
+        lambda s: s.interpolate(method="linear", limit_direction="both")
+    )
+    merged.to_csv(os.path.join(output_path, "merged_data_interpolated.csv"))
+
 def process_data(filename, measurement, replace_char="Z"):
     df = pd.read_csv(filename, parse_dates=["Time"])
 

@@ -182,10 +182,9 @@ if __name__ == "__main__":
     #         Prepare Collocation Points & Data
     #---------------------------------------------------
     # Load your measured data:
-    df = pd.read_csv("data/processed/merged_data_filtered.csv", parse_dates=["Time"])
+    df = pd.read_csv("data/processed/merged_data_interpolated.csv", parse_dates=["Time"])
     df["time_s"] = (df["Time"] - df["Time"].min()).dt.total_seconds()
     df["z_m"] = df["Height"] / 1000.0
-    df = df.dropna(subset=["VWC"])
 
     # Create tensors for the data (for data loss):
     t_data = torch.tensor(df["time_s"].values, dtype=torch.float32).reshape(-1,1)
@@ -251,7 +250,7 @@ if __name__ == "__main__":
     #                Training Loop
     #---------------------------------------------------
     pinn_model = PINN(num_hidden_layers=4, num_neurons=64)
-    optimizer = optim.Adam(pinn_model.parameters(), lr=1e-3)
+    optimizer = optim.Adam(pinn_model.parameters(), lr=3e-4)
 
     num_epochs = 1000
 
@@ -276,11 +275,11 @@ if __name__ == "__main__":
         loss_data = data_loss(pinn_model, t_data, z_data, theta_data, T_measured_data)
         
         # Combine losses (you may want to weight these differently)
-        loss = loss_pde + loss_bc_top + 0.1*loss_bc_bot + loss_ic + loss_data
+        loss = 100000*loss_pde + loss_bc_top + 0.1*loss_bc_bot + loss_ic + loss_data
         loss.backward()
         optimizer.step()
         
-        if epoch % 500 == 0:
+        if epoch % 100 == 0:
             print(f"Epoch {epoch} - Total Loss: {loss.item():.6f} "
                 f"(PDE: {loss_pde.item():.6f}, BC_top: {loss_bc_top.item():.6f}, "
                 f"BC_bot: {loss_bc_bot.item():.6f}, IC: {loss_ic.item():.6f}, Data: {loss_data.item():.6f})")
