@@ -29,6 +29,12 @@ def clean_data(raw_data_path="data/raw", output_path="data/processed"):
     merged["VWC"] = merged.groupby("Time")["VWC"].transform(
         lambda s: s.interpolate(method="linear", limit_direction="both")
     )
+
+    merged["ThermalConductivity"] = merged.groupby("Time")["ThermalConductivity"].transform(
+        lambda s: s.interpolate(method="linear", limit_direction="both")
+    )
+    merged["ThermalConductivity"] = merged["ThermalConductivity"].ffill().bfill()
+
     merged.to_csv(os.path.join(output_path, "merged_data_interpolated.csv"))
 
 def process_data(filename, measurement, replace_char="Z"):

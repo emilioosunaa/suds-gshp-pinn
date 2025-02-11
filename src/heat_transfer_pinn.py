@@ -6,9 +6,18 @@ import pandas as pd
 from scipy.interpolate import griddata
 
 class PINN(nn.Module):
-    def __init__(self, num_hidden_layers=4, num_neurons=64):
+    def __init__(self, num_hidden_layers=4, num_neurons=64,
+                 t_mean=None, t_std=None, z_mean=None, z_std=None, theta_mean=None, theta_std=None):
         super(PINN, self).__init__()
         
+        # Store the normalization parameters
+        self.t_mean = t_mean
+        self.t_std = t_std
+        self.z_mean = z_mean
+        self.z_std = z_std
+        self.theta_mean = theta_mean
+        self.theta_std = theta_std
+
         # Input layer: (t, z, theta) -> hidden
         self.input_layer = nn.Linear(3, num_neurons)
         
@@ -33,8 +42,13 @@ class PINN(nn.Module):
                 nn.init.zeros_(m.bias)
 
     def forward(self, t, z, theta):
+        # Normalize inputs
+        t_norm = normalize(t, self.t_mean, self.t_std)
+        z_norm = normalize(z, self.z_mean, self.z_std)
+        theta_norm = normalize(theta, self.theta_mean, self.theta_std)
+
         # Concatenate inputs
-        x = torch.cat([t, z, theta], dim=1)  # shape: (batch_size, 3)
+        x = torch.cat([t_norm, z_norm, theta_norm], dim=1)  # shape: (batch_size, 3)
         
         # Forward pass
         x = self.input_layer(x)
@@ -62,24 +76,29 @@ def C_sand(theta):
     den = 1.0 + torch.exp(-3.24*(theta - 5.27))
     return 296.4 + num/den
 
-def alpha(z, theta, z_top=0.150):
-    alpha_val = torch.where(z <= z_top,
-                            alpha_topsoil(theta),
-                            alpha_sand(theta))
-    return alpha_val
+# def alpha(z, theta, z_top=0.150):
+#     alpha_val = torch.where(z <= z_top,
+#                             alpha_topsoil(theta),
+#                             alpha_sand(theta))
+#     return alpha_val
+
+def alpha(z, theta, z_top=0.150, beta=100.0):
+    # sigma: a smooth approximation to a step function.
+    sigma = torch.sigmoid(beta*(z - z_top))
+    return alpha_topsoil(theta) * (1 - sigma) + alpha_sand(theta) * sigma
 
 #---------------------------------------------------
 #                   PDE Residual
 # --------------------------------------------------  
 def pde_residual(model, t, z, theta):
     """
-    PDE:  dT/dt = alpha(theta) * d2T/dz^2
+    PDE:  dT/dt = alpha(theta) * d2T/dz^2 + (dalpha/dz)*dT/dz
     """
-    # We only differentiate T w.r.t. t and z:
+    # Ensure t and z require gradients
     t.requires_grad = True
     z.requires_grad = True
-    
-    # Theta can be a plain tensor (no 'requires_grad'):
+
+    # Evaluate the model: T = T(t, z, theta)
     T_pred = model(t, z, theta)  # shape: (N,1)
 
     # 1) dT/dt
@@ -109,11 +128,20 @@ def pde_residual(model, t, z, theta):
         create_graph=True
     )[0]
 
-    # 4) Evaluate alpha from the measured theta
+    # 4) Evaluate alpha (thermal diffusivity) at (z, theta)
     alpha_val = alpha(z, theta)
 
-    # 5) PDE residual (no partial_alpha_partial_z term)
-    residual = dT_dt - alpha_val * d2T_dz2
+    # 5) Compute dalpha/dz
+    dalpha_dz = torch.autograd.grad(
+        alpha_val,
+        z,
+        grad_outputs=torch.ones_like(alpha_val),
+        retain_graph=True,
+        create_graph=True
+    )[0]
+
+    # 6) PDE residual: dT/dt - alpha * d2T/dz^2 - (dalpha/dz)*dT/dz = 0
+    residual = dT_dt - alpha_val * d2T_dz2 - dalpha_dz * dT_dz
 
     return residual
 
@@ -121,18 +149,17 @@ def pde_residual(model, t, z, theta):
 #---------------------------------------------------
 #                   Boundary Conditions
 # --------------------------------------------------
-def top_boundary_loss(model, t_bc, T_bc, theta_bc):
+def top_boundary_loss(model, t_bc, z_top, T_bc, theta_bc):
     """
     model: PINN
     t_bc: times at top boundary
     T_bc: known boundary temperature at z=0.40
     theta_bc: known theta at top boundary
     """
-    z0 = 0.04 * torch.ones_like(t_bc)
-    T_pred = model(t_bc, z0, theta_bc)
+    T_pred = model(t_bc, z_top, theta_bc)
     return (T_pred.squeeze() - T_bc.squeeze())**2
 
-def bottom_flux_loss(model, t_bc, z_bot, q_bc, theta_bot):
+def bottom_flux_loss(model, t_bc, z_bot, q_bc, theta_bot, k_bot):
     """
     -k(theta) * dT/dz = q_bc(t)
     z_bot: the bottom depth (e.g., 0.94 m)
@@ -141,7 +168,7 @@ def bottom_flux_loss(model, t_bc, z_bot, q_bc, theta_bot):
     # Forward pass
     t_bc.requires_grad = True
     z_bot.requires_grad = True
-    theta_bot.requires_grad = True
+    # theta_bot.requires_grad = True
     
     T_pred = model(t_bc, z_bot, theta_bot)
     
@@ -153,12 +180,12 @@ def bottom_flux_loss(model, t_bc, z_bot, q_bc, theta_bot):
                                 create_graph=True)[0]
     
     # k = alpha * C
-    alpha_val = alpha_sand(theta_bot)
-    C_val = C_sand(theta_bot)
-    k_val = alpha_val * C_val  # (N,1)
+    # alpha_val = alpha_sand(theta_bot)
+    # C_val = C_sand(theta_bot)
+    # k_val = alpha_val * C_val  # (N,1)
     
     # flux_pred = -k * dT_dz
-    flux_pred = -k_val * dT_dz
+    flux_pred = -k_bot * dT_dz
     
     return (flux_pred.squeeze() - q_bc.squeeze())**2
 
@@ -177,7 +204,17 @@ def data_loss(model, t, z, theta, T_meas):
     T_pred = model(t, z, theta)
     return torch.mean((T_pred - T_meas)**2)
 
+def normalize(tensor, tensor_mean, tensor_std):
+    return (tensor - tensor_mean) / tensor_std
+
 if __name__ == "__main__":
+
+    w_pde = 1.0
+    w_bc_top = 10
+    w_bc_bot = 10
+    w_ic = 10
+    w_data = 1.0
+
     #---------------------------------------------------
     #         Prepare Collocation Points & Data
     #---------------------------------------------------
@@ -191,6 +228,12 @@ if __name__ == "__main__":
     z_data = torch.tensor(df["z_m"].values, dtype=torch.float32).reshape(-1,1)
     theta_data = torch.tensor(df["VWC"].values, dtype=torch.float32).reshape(-1,1)
     T_measured_data = torch.tensor(df["SoilTemp"].values, dtype=torch.float32).reshape(-1,1)
+    k_measured_data = torch.tensor(df["ThermalConductivity"].values, dtype=torch.float32).reshape(-1,1)
+
+    # Calculate normalization parameters from training data
+    t_mean, t_std = t_data.mean(), t_data.std()
+    z_mean, z_std = z_data.mean(), z_data.std()
+    theta_mean, theta_std = theta_data.mean(), theta_data.std()
 
     # For PDE collocation, you may still use a mesh covering the domain.
     t_min = df["time_s"].min()
@@ -237,6 +280,7 @@ if __name__ == "__main__":
     t_bc_bot = torch.tensor(df_bot["time_s"].values, dtype=torch.float32).reshape(-1,1)
     q_bc_bot_val = torch.tensor(df_hf["HF.Bottom"].values, dtype=torch.float32).reshape(-1, 1)
     theta_bc_bot = torch.tensor(df_bot["VWC"].values, dtype=torch.float32).reshape(-1,1)
+    k_bc_bot = torch.tensor(df_bot["ThermalConductivity"].values, dtype=torch.float32).reshape(-1,1)
 
     # Initial condition: use data from the earliest time.
     t0_val = df["time_s"].min()
@@ -249,10 +293,13 @@ if __name__ == "__main__":
     #---------------------------------------------------
     #                Training Loop
     #---------------------------------------------------
-    pinn_model = PINN(num_hidden_layers=4, num_neurons=64)
-    optimizer = optim.Adam(pinn_model.parameters(), lr=3e-4)
+    pinn_model = PINN(num_hidden_layers=4, num_neurons=64,
+                      t_mean=t_mean, t_std=t_std,
+                      z_mean=z_mean, z_std=z_std,
+                      theta_mean=theta_mean, theta_std=theta_std)
+    optimizer = optim.Adam(pinn_model.parameters(), lr=1e-3)
 
-    num_epochs = 1000
+    num_epochs = 5000
 
     for epoch in range(num_epochs):
         optimizer.zero_grad()
@@ -262,12 +309,13 @@ if __name__ == "__main__":
         loss_pde = torch.mean(res_pde**2)
         
         # 2) Top boundary loss (using measured top-boundary theta)
-        loss_bc_top = torch.mean(top_boundary_loss(pinn_model, t_bc_top, T_bc_top_val, theta_bc_top))
+        z_bc_top = torch.full_like(t_bc_top, z_min)  # set top depth to min z in domain
+        loss_bc_top = torch.mean(top_boundary_loss(pinn_model, t_bc_top, z_bc_top, T_bc_top_val, theta_bc_top))
         
         # 3) Bottom boundary loss (using measured bottom-boundary theta)
         z_bot = torch.full_like(t_bc_bot, z_max)  # set bottom depth to max z in domain
-        loss_bc_bot = torch.mean(bottom_flux_loss(pinn_model, t_bc_bot, z_bot, q_bc_bot_val, theta_bc_bot))
-        
+        loss_bc_bot = torch.mean(bottom_flux_loss(pinn_model, t_bc_bot, z_bot, q_bc_bot_val, theta_bc_bot, k_bc_bot))
+
         # 4) Initial condition loss (using measured theta at t=0)
         loss_ic = torch.mean(initial_condition_loss(pinn_model, z_ic_vals, T_ic_vals, theta_ic_vals))
         
@@ -275,7 +323,7 @@ if __name__ == "__main__":
         loss_data = data_loss(pinn_model, t_data, z_data, theta_data, T_measured_data)
         
         # Combine losses (you may want to weight these differently)
-        loss = 100000*loss_pde + loss_bc_top + 0.1*loss_bc_bot + loss_ic + loss_data
+        loss = w_pde * loss_pde + w_bc_top * loss_bc_top + w_bc_bot * loss_bc_bot + w_ic * loss_ic + w_data * loss_data
         loss.backward()
         optimizer.step()
         
