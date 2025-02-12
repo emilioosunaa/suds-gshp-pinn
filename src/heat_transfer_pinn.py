@@ -4,6 +4,7 @@ import torch.optim as optim
 import numpy as np
 import pandas as pd
 from scipy.interpolate import griddata
+from sklearn.model_selection import train_test_split
 
 class PINN(nn.Module):
     def __init__(self, num_hidden_layers=4, num_neurons=64,
@@ -209,33 +210,48 @@ def normalize(tensor, tensor_mean, tensor_std):
 
 if __name__ == "__main__":
 
+    # Check for GPU
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print("Using device:", device)
+
     w_pde = 1.0
     w_bc_top = 10
     w_bc_bot = 10
-    w_ic = 10
-    w_data = 1.0
+    w_ic = 1.0
+    w_data = 10
 
     #---------------------------------------------------
     #         Prepare Collocation Points & Data
     #---------------------------------------------------
-    # Load your measured data:
+							  
     df = pd.read_csv("data/processed/merged_data_interpolated.csv", parse_dates=["Time"])
     df["time_s"] = (df["Time"] - df["Time"].min()).dt.total_seconds()
     df["z_m"] = df["Height"] / 1000.0
 
-    # Create tensors for the data (for data loss):
-    t_data = torch.tensor(df["time_s"].values, dtype=torch.float32).reshape(-1,1)
-    z_data = torch.tensor(df["z_m"].values, dtype=torch.float32).reshape(-1,1)
-    theta_data = torch.tensor(df["VWC"].values, dtype=torch.float32).reshape(-1,1)
-    T_measured_data = torch.tensor(df["SoilTemp"].values, dtype=torch.float32).reshape(-1,1)
-    k_measured_data = torch.tensor(df["ThermalConductivity"].values, dtype=torch.float32).reshape(-1,1)
+												
+    df_train, df_test = train_test_split(df, test_size=0.2, random_state=42)
 
-    # Calculate normalization parameters from training data
+    df_test.to_csv("data/processed/test_data.csv", index=False)
+
+    # Tensors for training data
+    t_data = torch.tensor(df_train["time_s"].values, dtype=torch.float32).reshape(-1,1)
+    z_data = torch.tensor(df_train["z_m"].values, dtype=torch.float32).reshape(-1,1)
+    theta_data = torch.tensor(df_train["VWC"].values, dtype=torch.float32).reshape(-1,1)
+    T_measured_data = torch.tensor(df_train["SoilTemp"].values, dtype=torch.float32).reshape(-1,1)
+    k_measured_data = torch.tensor(df_train["ThermalConductivity"].values, dtype=torch.float32).reshape(-1,1)
+
+    # Tensors for test data
+    t_test_data = torch.tensor(df_test["time_s"].values, dtype=torch.float32).reshape(-1,1)
+    z_test_data = torch.tensor(df_test["z_m"].values,     dtype=torch.float32).reshape(-1,1)
+    theta_test_data = torch.tensor(df_test["VWC"].values, dtype=torch.float32).reshape(-1,1)
+    T_meas_test_data = torch.tensor(df_test["SoilTemp"].values, dtype=torch.float32).reshape(-1,1)
+
+    # Compute normalization parameters
     t_mean, t_std = t_data.mean(), t_data.std()
     z_mean, z_std = z_data.mean(), z_data.std()
     theta_mean, theta_std = theta_data.mean(), theta_data.std()
 
-    # For PDE collocation, you may still use a mesh covering the domain.
+    # Collocation grid
     t_min = df["time_s"].min()
     t_max = df["time_s"].max()
     z_min = df["z_m"].min()
@@ -247,14 +263,14 @@ if __name__ == "__main__":
     z_lin = np.linspace(z_min, z_max, N_z)
     T_mesh, Z_mesh = np.meshgrid(t_lin, z_lin, indexing='xy')
 
-    # Each measured point is (time, depth)
+    # Interpolate VWC onto collocation grid
     measured_points = np.column_stack((df["time_s"].values, df["z_m"].values))
-    theta_measured = df["VWC"].values  # measured θ values
+    theta_measured = df["VWC"].values
 
-    # Interpolate θ on the collocation grid (linear interpolation)
+																   
     Theta_mesh = griddata(measured_points, theta_measured, (T_mesh, Z_mesh), method='linear')
 
-    # For points outside the convex hull, fill missing values with nearest-neighbor interpolation:
+    # Fill missing with nearest
     nan_idx = np.isnan(Theta_mesh)
     if np.any(nan_idx):
         Theta_mesh[nan_idx] = griddata(measured_points, theta_measured, (T_mesh, Z_mesh), method='nearest')[nan_idx]
@@ -264,25 +280,26 @@ if __name__ == "__main__":
     theta_col = torch.tensor(Theta_mesh.flatten(), dtype=torch.float32).reshape(-1,1)
 
     #---------------------------------------------------
-    #       Extract Boundary & Initial Conditions from Data
+    #       Boundary & Initial Conditions
     #---------------------------------------------------
-    # Top boundary: use the shallowest sensor data.
+    # Top boundary
     df_top = df[df["z_m"] == df["z_m"].min()].sort_values(by="time_s")
     t_bc_top = torch.tensor(df_top["time_s"].values, dtype=torch.float32).reshape(-1,1)
     T_bc_top_val = torch.tensor(df_top["SoilTemp"].values, dtype=torch.float32).reshape(-1,1)
     theta_bc_top = torch.tensor(df_top["VWC"].values, dtype=torch.float32).reshape(-1,1)
 
-    # Bottom boundary: use the deepest sensor data.
+    # Bottom boundary
     df_hf = pd.read_csv("data/raw/PLEXUS@NGIF_HeatFlux_20190718_20190912.csv", parse_dates=["Time"])
     df_hf["time_s"] = (df_hf["Time"] - df_hf["Time"].min()).dt.total_seconds()
     df_hf = df_hf.sort_values(by="time_s")
+
     df_bot = df[df["z_m"] == df["z_m"].max()].sort_values(by="time_s")
     t_bc_bot = torch.tensor(df_bot["time_s"].values, dtype=torch.float32).reshape(-1,1)
     q_bc_bot_val = torch.tensor(df_hf["HF.Bottom"].values, dtype=torch.float32).reshape(-1, 1)
     theta_bc_bot = torch.tensor(df_bot["VWC"].values, dtype=torch.float32).reshape(-1,1)
     k_bc_bot = torch.tensor(df_bot["ThermalConductivity"].values, dtype=torch.float32).reshape(-1,1)
 
-    # Initial condition: use data from the earliest time.
+    # Initial condition
     t0_val = df["time_s"].min()
     df_ic = df[df["time_s"] == t0_val].sort_values(by="z_m")
     z_ic_vals = torch.tensor(df_ic["z_m"].values, dtype=torch.float32).reshape(-1,1)
@@ -291,46 +308,94 @@ if __name__ == "__main__":
 
 
     #---------------------------------------------------
-    #                Training Loop
+    #                Model & Optimizer
     #---------------------------------------------------
     pinn_model = PINN(num_hidden_layers=4, num_neurons=64,
                       t_mean=t_mean, t_std=t_std,
                       z_mean=z_mean, z_std=z_std,
-                      theta_mean=theta_mean, theta_std=theta_std)
+                      theta_mean=theta_mean, theta_std=theta_std).to(device)
+
     optimizer = optim.Adam(pinn_model.parameters(), lr=1e-3)
 
-    num_epochs = 5000
+    # Move all data to GPU (if available)
+    t_data = t_data.to(device)
+    z_data = z_data.to(device)
+    theta_data = theta_data.to(device)
+    T_measured_data = T_measured_data.to(device)
+    k_measured_data = k_measured_data.to(device)
+
+    t_test_data = t_test_data.to(device)
+    z_test_data = z_test_data.to(device)
+    theta_test_data = theta_test_data.to(device)
+    T_meas_test_data = T_meas_test_data.to(device)
+
+    t_col = t_col.to(device)
+    z_col = z_col.to(device)
+    theta_col = theta_col.to(device)
+
+    t_bc_top = t_bc_top.to(device)
+    T_bc_top_val = T_bc_top_val.to(device)
+    theta_bc_top = theta_bc_top.to(device)
+
+    t_bc_bot = t_bc_bot.to(device)
+    q_bc_bot_val = q_bc_bot_val.to(device)
+    theta_bc_bot = theta_bc_bot.to(device)
+    k_bc_bot = k_bc_bot.to(device)
+
+    z_ic_vals = z_ic_vals.to(device)
+    T_ic_vals = T_ic_vals.to(device)
+    theta_ic_vals = theta_ic_vals.to(device)
+
+    num_epochs = 600000
 
     for epoch in range(num_epochs):
         optimizer.zero_grad()
         
-        # 1) PDE residual loss (from collocation points)
+        # 1) PDE residual loss
         res_pde = pde_residual(pinn_model, t_col, z_col, theta_col)
         loss_pde = torch.mean(res_pde**2)
         
-        # 2) Top boundary loss (using measured top-boundary theta)
-        z_bc_top = torch.full_like(t_bc_top, z_min)  # set top depth to min z in domain
+        # 2) Top boundary loss
+        z_bc_top = torch.full_like(t_bc_top, z_min).to(device)
         loss_bc_top = torch.mean(top_boundary_loss(pinn_model, t_bc_top, z_bc_top, T_bc_top_val, theta_bc_top))
         
-        # 3) Bottom boundary loss (using measured bottom-boundary theta)
-        z_bot = torch.full_like(t_bc_bot, z_max)  # set bottom depth to max z in domain
+        # 3) Bottom boundary loss
+        z_bot = torch.full_like(t_bc_bot, z_max).to(device)
         loss_bc_bot = torch.mean(bottom_flux_loss(pinn_model, t_bc_bot, z_bot, q_bc_bot_val, theta_bc_bot, k_bc_bot))
 
-        # 4) Initial condition loss (using measured theta at t=0)
+        # 4) Initial condition loss
         loss_ic = torch.mean(initial_condition_loss(pinn_model, z_ic_vals, T_ic_vals, theta_ic_vals))
         
-        # 5) Data mismatch loss (comparing model predictions to all measured data)
-        loss_data = data_loss(pinn_model, t_data, z_data, theta_data, T_measured_data)
+        # 5) Data mismatch loss
+        loss_data_val = data_loss(pinn_model, t_data, z_data, theta_data, T_measured_data)
         
-        # Combine losses (you may want to weight these differently)
-        loss = w_pde * loss_pde + w_bc_top * loss_bc_top + w_bc_bot * loss_bc_bot + w_ic * loss_ic + w_data * loss_data
+        # Combine losses
+        loss = (w_pde * loss_pde +
+                w_bc_top * loss_bc_top +
+                w_bc_bot * loss_bc_bot +
+                w_ic * loss_ic +
+                w_data * loss_data_val)
+        
         loss.backward()
         optimizer.step()
         
         if epoch % 100 == 0:
-            print(f"Epoch {epoch} - Total Loss: {loss.item():.6f} "
-                f"(PDE: {loss_pde.item():.6f}, BC_top: {loss_bc_top.item():.6f}, "
-                f"BC_bot: {loss_bc_bot.item():.6f}, IC: {loss_ic.item():.6f}, Data: {loss_data.item():.6f})")
+            print(f"Epoch {epoch} | "
+                  f"Total Loss: {loss.item():.6f} | "
+                  f"PDE: {loss_pde.item():.6f}, "
+                  f"BC_top: {loss_bc_top.item():.6f}, "
+                  f"BC_bot: {loss_bc_bot.item():.6f}, "
+                  f"IC: {loss_ic.item():.6f}, "
+                  f"Data: {loss_data_val.item():.6f}")
 
     torch.save(pinn_model.state_dict(), "pinn_model.pth")
     print("Model saved as 'pinn_model.pth'.")
+
+    # Evaluate on test set
+    with torch.no_grad():
+        T_pred_test = pinn_model(t_test_data, z_test_data, theta_test_data)
+        test_mse = torch.mean((T_pred_test - T_meas_test_data)**2).item()
+
+    print("Test MSE:", test_mse)
+
+
