@@ -19,15 +19,10 @@ class PINN(nn.Module):
         self.theta_mean = theta_mean
         self.theta_std = theta_std
 
-        # Input layer: (t, z, theta) -> hidden
         self.input_layer = nn.Linear(3, num_neurons)
-        
-        # Hidden layers
         self.hidden_layers = nn.ModuleList(
             [nn.Linear(num_neurons, num_neurons) for _ in range(num_hidden_layers)]
         )
-        
-        # Output layer: hidden -> T
         self.output_layer = nn.Linear(num_neurons, 1)
         
         # Activation
@@ -418,7 +413,7 @@ if __name__ == "__main__":
         total_loss.backward()
         return total_loss
 
-    lbfgs_steps = 50  # number of outer loop steps
+    lbfgs_steps = 100  # number of outer loop steps
     for i in range(lbfgs_steps):
         # One "step" of LBFGS can involve multiple internal iterations
         loss_value = lbfgs_optimizer.step(closure)
